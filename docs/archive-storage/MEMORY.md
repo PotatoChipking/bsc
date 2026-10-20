@@ -17,7 +17,7 @@
 
 | | 方案一：BSC 现网，保持原有架构 | 方案二：新链，新架构 + 硬分叉 |
 | --- | --- | --- |
-| 内容 | hash 归档换成 Geth path 归档；备选 Erigon / reth-bsc | 两层架构 + BAL 承诺 + 历史过期 + 去掉 logsBloom |
+| 内容 | hash 归档换成 Geth path 归档；备选 Erigon / reth-bsc | 三层架构 + BAL 承诺 + 历史过期 + 去掉 logsBloom |
 | 协议改动 | 无 | 有，需写进新链规范 |
 | 新开发量 | 很少，以实测、迁移、运维为主 | 大 |
 | 扩容 | 需要时复用方案二的第一层、第二层代码，不另做一套 | 内建 |
@@ -62,7 +62,7 @@ BSC 归档节点，原方案（hash 归档）与方案一（path 归档）：
 
 ### 方案一要点
 
-- 参考配置：`--state.scheme path --gcmode archive --syncmode full --history.state 0`；需要历史 `eth_getProof` 时加 `--history.trienode 0`（体积会明显增加）。
+- 参考配置：`--state.scheme path --gcmode archive --syncmode full --history.state 0 --history.trienode 0`。归档要求支持历史 `eth_getProof`，所以 trienode 历史必须开启（默认关闭，开启后体积会明显增加，需单独实测）。
 - 当初没用 path 归档不是代码障碍（BSC 对 `triedb`/`pathdb` 的改动已核对，与归档无关），更可能是时间线与迁移成本：
   - path 归档到 BSC v1.6.0（合并 geth v1.16.1）才出现；
   - BSC 删除了 hash 转 path 的 `hbss2pbss` 工具（bnb-chain/bsc PR #3346），只能重新同步；
@@ -72,9 +72,13 @@ BSC 归档节点，原方案（hash 归档）与方案一（path 归档）：
 
 ### 方案二要点
 
-- **两层结构**（需兼容 EVM，两层都要做）：
+- **三层结构**（需兼容 EVM，且归档要求保留全部数据、包括历史证明，三层都要做）：
   - 第一层（流式历史）：区块、收据、BAL 按高度写成不可变分段，存于对象存储，提供拉流接口。这是唯一的权威数据；分段自包含（区间起点 checkpoint + 区间内区块与状态变更），裁剪即整段删除。
-  - 第二层（EVM 历史查询）：key-segments、key-index、tx-index、log-index 与历史状态读取器，提供 `eth_call`@N、trace、`eth_getLogs`。只建索引，指向第一层文件中约 64KB 的压缩帧，可从第一层重建。
+  - 第二层（历史查询与 trace）：key-segments、key-index、tx-index、log-index 与历史状态读取器，提供 `eth_call`@N、trace、`eth_getLogs`。只建索引，指向第一层文件中约 64KB 的压缩帧，可从第一层重建。
+  - 第三层（历史证明）：每个区块变化的 trie 节点差异（沿用上游 trienode 历史格式，每个节点每 8 个版本存一次完整值，`triedb/pathdb/config.go:65`），由第一层的 BAL 逐块应用到 trie 上生成，可重建；按高度分段放对象存储低价层，提供任意历史区块的 `eth_getProof`。预计是三层中最大的一层，体积待实测。
+- **为什么第三层必须预先存**：第一层在信息上完整，但证明需要区块 N 时路径上各层兄弟节点的哈希，现算要把 checkpoint 到 N 的全部写入应用到 trie 上，高 TPS 下不可用；BAL 也证明不了“之后没再被写过”。
+- **证明的分工**：最新区块和最近约 128 个块由全节点用本地当前 trie 加内存层提供；更早的由第三层的历史证明服务提供。
+- **“只存 BAL”的前提**：BAL 必须覆盖交易之外的状态变化，例如 Parlia 的系统交易（手续费分配、惩罚、验证者集合更新）和硬分叉时直接替换系统合约代码（`core/state_processor.go:96`、`consensus/parlia/parlia.go:1423`）；归档只收已最终确认的区块。BSC 现网没有 BAL，只能导出派生数据。
 - **协议改动（最小集合）**：BAL 承诺（区块头放哈希）、历史过期（类似 EIP-4444）、去掉 logsBloom。状态承诺结构与存储方案解耦，单独决策。
 - **BAL 与状态数据**：BAL 的写入部分就是节点执行后本来就有的 diff layer（正向变更），区别是提前可得、可验证、可长期保存。新链长期只存 BAL + 定期 checkpoint（第一层），pathdb 状态历史（旧值）只留短窗口；按高度读状态 = 最近 checkpoint + 之后各块 BAL 的新值。BAL 真正新增的只有交易序号、只读槽和链上承诺。
 - 新链量级：按每笔约 500B、压缩 3.5 倍估算，100k TPS 下约 1.23TB/天、450TB/年，单机归档从一开始就不可行。
@@ -173,7 +177,9 @@ BSC 归档节点，原方案（hash 归档）与方案一（path 归档）：
 - [ ] BAL 随区块传播还是只承诺哈希、异步传播（需与问题 3 一起定）。
 - [ ] 第一层长期保存完整 BAL，还是只存写入部分和交易序号（裁掉只读槽后无法再对区块头哈希校验）。
 - [ ] 第一层分段大小与 checkpoint 间隔；新链 pathdb 状态历史短窗口的长度。
-- [ ] 归档数据使用方与查询构成；历史 `eth_getProof` 需求；状态承诺结构；全节点历史窗口；历史服务运营方；SLA。
+- [x] 历史 `eth_getProof` —— 已确认归档必须支持全部历史区块，由第三层提供。
+- [ ] 第三层的实测体积与完整值间隔。
+- [ ] 归档数据使用方与查询构成；状态承诺结构；全节点历史窗口；历史服务运营方；SLA。
 - [ ] `StateUpdate` 能否完整取得明文地址与存储键；启用 `OnStateUpdate` 后的额外开销。
 
 ## 8. 建议的下一步
