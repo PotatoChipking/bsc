@@ -1,65 +1,113 @@
 # 归档存储方案：讨论记录与结论
 
-记录日期：2026-10-16。用途：保存归档存储（问题 1）讨论的背景、结论和代码依据，方便后续继续推进。
+最后更新：2026-10-20。用途：保存归档存储（问题 1）讨论的背景、结论和代码依据，方便后续继续推进。
 
-完整设计文档：https://claude.ai/code/artifact/918c0de5-9432-47c2-84f1-931dccc6d0d9
+完整设计文档（含“附录：参考资料”标签页）：https://claude.ai/code/artifact/918c0de5-9432-47c2-84f1-931dccc6d0d9
 
 ## 1. 背景
 
 - BSC 是 go-ethereum 的长期 fork，`go.mod` 的 module 名仍是 `github.com/ethereum/go-ethereum`。BSC 不 rebase，而是定期 merge 上游 release，目前对齐 geth v1.17.3（合并提交见 `d1d934a`、`422b270`、`edb32e7`、`6d65a79`），BSC 自身版本为 1.8.0。
-- BNB Chain 计划推出下一代 L1（公开路线图：2026 年底测试网、2027 年初主网），该链**需要兼容 EVM**（已确认）。
+- BNB Chain 计划推出兼容 EVM 的下一代 L1（公开路线图：2026 年底测试网、2027 年初主网），**从新的创世块开始，不继承 BSC 的状态和历史**，目标 100k TPS 级别。
 - 团队提出的三个问题：
   1. 归档节点约 50TB 且每天增长，需要优化存储（**本记录聚焦此问题**）；
   2. 新验证者同步慢；
   3. 验证者间区块同步约 40ms，其中网络约 20ms。
 
-## 2. 关于 50TB 的判断
+## 2. 两个方案（文档的主线）
 
-结论：50TB 是 hash scheme 且保留大量历史状态的节点，即 **hash 归档节点**；但很可能不是从创世块开始的完整归档，而是从某个快照高度开始的归档。
-
-| 节点类型（BSC 主网） | 体积 | 依据 |
+| | 方案一：BSC 现网，保持原有架构 | 方案二：新链，新架构 + 硬分叉 |
 | --- | --- | --- |
-| 轻节点 | 约 0.08–0.13TB（理论值） | 当前 BSC 只有 snap/full 同步，没有轻节点；按 1.28 亿个区块头 × 0.6–1KB 估算 |
-| path 全节点（裁剪老区块） | 约 1.7TB | 官方 2026-08-05 快照 |
-| path 全节点（完整区块） | 约 6.6TB | 同上；72 天增长 0.6TB，约 8GB/天 |
-| 差异式归档（Erigon、reth-bsc） | 约 5–7.7TB | reth-bsc 归档快照 7.02TiB |
-| hash 归档 | 2022 年约 30TB；约 2023 年约 50TB | NodeReal 等 |
+| 内容 | hash 归档换成 Geth path 归档；备选 Erigon / reth-bsc | 两层架构 + BAL 承诺 + 历史过期 + 去掉 logsBloom |
+| 协议改动 | 无 | 有，需写进新链规范 |
+| 新开发量 | 很少，以实测、迁移、运维为主 | 大 |
+| 扩容 | 需要时复用方案二的第一层、第二层代码，不另做一套 | 内建 |
 
-推理要点：
+评估框架：归档只追加，任何方案都只能降低增长率，所以看“增长会不会成为瓶颈”。五条标准：
 
-- 50TB 是 path 完整全节点的 7.6 倍、差异式归档的 6.5 倍以上；区块、交易与收据只有约 4.9TB，剩下约 43TB 只能是历史状态，而只有 hash scheme 会原样保留历史 trie 节点。
-- 30TB → 50TB 约用一年（约 55GB/天，当时每天 2.88 万块）。按此外推，从创世块同步的完整 hash 归档今天应 ≥120TB，所以 50TB 更可能是从快照高度开始的归档。
-- 区块高度约 1.28 亿，是用 `params/config.go` 的硬分叉时间和出块间隔（3s → Lorentz 1.5s → Maxwell 0.75s → Fermi 0.45s）推算的；现在每天约 19.2 万块。
-- 外部数字均来自搜索结果摘要，未能打开原文；公共 BSC RPC 在当前环境被代理拦截，无链上实测。
+- C1 验证者和全节点存储有上界；
+- C2 历史存储可水平扩展；
+- C3 单次查询延迟不随历史长度变长；
+- C4 单位成本低、支持冷热分层；
+- C5 新建或恢复查询节点的时间不随历史长度变长。
+
+三类措施（降开销、可扩展、可验证）需组合使用。方案一不满足 C1、C2、C4、C5，只是短期缓解。
+
+### 方案一要点
+
+- 参考配置：`--state.scheme path --gcmode archive --syncmode full --history.state 0`；需要历史 `eth_getProof` 时加 `--history.trienode 0`（体积会明显增加）。
+- 当初没用 path 归档不是代码障碍（BSC 对 `triedb`/`pathdb` 的改动已核对，与归档无关），更可能是时间线与迁移成本：
+  - path 归档到 BSC v1.6.0（合并 geth v1.16.1）才出现；
+  - BSC 删除了 hash 转 path 的 `hbss2pbss` 工具（bnb-chain/bsc PR #3346），只能重新同步；
+  - 带证明的 path 归档到 v1.8.0-alpha 才支持。
+- 先实测再定主选：体积与构成、日增量、追块速度、历史 RPC 的正确性与延迟，并与 Erigon、reth-bsc 对比；同时确定起始高度（快照高度或创世块）。
+- 扩容路径（按需）：把 BSC 历史转换成方案二的分段格式，复用方案二的历史服务。
+
+### 方案二要点
+
+- **两层结构**（需兼容 EVM，两层都要做）：
+  - 第一层（流式历史）：区块、收据、BAL 按高度写成不可变分段，存于对象存储，提供拉流接口。这是唯一的权威数据；分段自包含（区间起点 checkpoint + 区间内区块与状态变更），裁剪即整段删除。
+  - 第二层（EVM 历史查询）：key-segments、key-index、tx-index、log-index 与历史状态读取器，提供 `eth_call`@N、trace、`eth_getLogs`。只建索引，指向第一层文件中约 64KB 的压缩帧，可从第一层重建。
+- **协议改动（最小集合）**：BAL 承诺（区块头放哈希）、历史过期（类似 EIP-4444）、去掉 logsBloom。状态承诺结构与存储方案解耦，单独决策。
+- **BAL 与状态数据**：BAL 的写入部分就是节点执行后本来就有的 diff layer（正向变更），区别是提前可得、可验证、可长期保存。新链长期只存 BAL + 定期 checkpoint（第一层），pathdb 状态历史（旧值）只留短窗口；按高度读状态 = 最近 checkpoint + 之后各块 BAL 的新值。BAL 真正新增的只有交易序号、只读槽和链上承诺。
+- 新链量级：按每笔约 500B、压缩 3.5 倍估算，100k TPS 下约 1.23TB/天、450TB/年，单机归档从一开始就不可行。
+- 主要风险：时间紧；BAL 增大区块，可能与问题 3 的延迟目标冲突；对象存储点查延迟（几十毫秒/次）；索引随历史增长（100k TPS 下 tx-index 约 8TB/年）；成本线性增长。
+
+### 需要拍板的事项（文档开头的决策表）
+
+| 决策 | 截止 |
+| --- | --- |
+| 方案一主选与起始高度 | 随时，先实测再定 |
+| BAL 用途与传播方式、历史过期、去掉 logsBloom | 测试网规范冻结前；之后再改就是硬分叉 |
+| 第一层格式（压缩帧与偏移表、manifest）、分段大小、checkpoint 间隔 | 第一个分段写出前；之后再改要重写全部历史 |
+| 第二层索引、查询节点、缓存与 RPC 覆盖范围 | 新链主网上线后迭代 |
+| 状态承诺结构 | 单独决策 |
+
+## 3. 节点类型与各自存储的数据
+
+各类节点的区块数据基本相同，区别几乎全在历史状态。下面的默认值取自当前 BSC 代码，时间按 0.45 秒出块换算。
+
+| 数据 | 全节点（path，默认） | 全节点（hash） | path 归档 | hash 归档 |
+| --- | --- | --- | --- | --- |
+| 区块头、区块体、收据 | 全部（可用 `--history.blocks` 裁剪，最少 60 万块） | 同左 | 全部（强制） | 全部（强制） |
+| blob sidecar | 约 19.2 天 | 同左 | 同左 | 同左 |
+| 交易哈希索引 | 235 万块（约 12 天） | 同左 | 全部 | 全部 |
+| 日志索引 | 57.6 万块（约 3 天） | 同左 | **不会自动扩展**，需 `--history.logs 0` | 同左 |
+| 历史状态 | 60 万块反向差异（约 3.1 天） | 无完整历史，旧 trie 节点累积到离线裁剪 | 全部反向差异 + 索引 | 每块写入的全部 trie 节点 |
+| 原像 | 不记录 | 不记录 | 记录（强制） | 记录（强制） |
+| trie 节点历史 | 无 | 无 | 可选 `--history.trienode` | 不需要 |
+
+补充说明：
+
+- BSC 的 `FullImmutabilityThreshold` 是 60 万块（上游为 9 万块）。
+- Parlia 快照每 1024 块存一份，未发现清理逻辑。
+- BSC 当前没有轻节点（只支持 snap/full 同步）。
+- `--syncmode`、`--gcmode`、`--history.*` 是三个独立开关；只有 `full sync + gcmode archive` 才有从创世块起的完整历史状态。
+
+状态裁剪方式：
+
+- hash 运行时：引用计数，只在内存丢弃（`core/blockchain.go:2073-2080`），落盘后不再删除；
+- hash 离线：`geth snapshot prune-state`，布隆过滤器标记后遍历全库逐个 `batch.Delete`，再 compaction（`core/state/pruner/pruner.go:122-225`）；
+- path 当前状态：按路径原地覆盖或删除（`triedb/pathdb/flush.go:46-55`）；
+- path 状态历史：freezer 尾部截断，整文件删除（`triedb/pathdb/history.go:301`、`core/rawdb/freezer_table.go:720`）。
+
+## 4. 关于 50TB 的判断
+
+结论：50TB 是 hash scheme 且保留大量历史状态的节点，即 **hash 归档**；但很可能是从某个快照高度开始的归档，而不是从创世块开始。
+
+- 体积对比：path 全节点约 6.6TB（裁剪老区块后约 1.7TB）；差异式归档（Erigon、reth-bsc）约 5–7.7TB；hash 归档在 2022 年约 30TB，约 2023 年约 50TB。
+- 区块、交易与收据只有约 4.9TB，剩下的约 43TB 只能是历史状态，而只有 hash scheme 会原样保留历史 trie 节点。
+- 按 30TB → 50TB 约 55GB/天外推，从创世块开始的完整 hash 归档今天应 ≥120TB。
+- 区块高度约 1.28 亿（由 `params/config.go` 的硬分叉时间推算），现在每天约 19.2 万块。
+- 外部数字来自第三方公开资料，仅作量级参考。
 
 确认方法：
 
 1. 查看 `--state.scheme`、`--gcmode`；
-2. `geth db inspect` 看 trie 节点占比；
+2. 运行 `geth db inspect`；
 3. 对第 1、1000 万、5000 万块调用 `eth_getBalance`，看最早可用状态；
-4. 记录一周日增量（path 全节点约 8GB/天；hash 归档在 2022–2023 年约 55GB/天）。
+4. 记录一周日增量。
 
-## 3. 关键概念（讨论中澄清过）
-
-- 三个**独立**开关：`--syncmode`（snap/full，决定初始状态从哪来）、`--gcmode`（full/archive，决定旧状态删不删）、`--history.blocks` / `--history.chain`（决定老区块删不删）。"archive sync" 不是同步方式。
-- 只有 `full sync + gcmode archive` 才有从创世块起的完整历史状态；snap sync + archive 只有 pivot 之后的。
-- 归档节点存的是**每个历史区块时**的全部账户状态，体积大头是历史状态，不是区块。
-- 状态裁剪方式：
-  - hash 运行时：引用计数，只在内存丢弃（`core/blockchain.go:2073-2080` 的 `Dereference`），落盘后不再删除；
-  - hash 离线：`geth snapshot prune-state`，布隆过滤器标记存活节点后遍历全库逐个 `batch.Delete`，再 compaction（`core/state/pruner/pruner.go:122-225`）；
-  - path 当前状态：按路径原地覆盖或删除（`triedb/pathdb/flush.go:46-55`），没有垃圾；
-  - path 状态历史：freezer 尾部截断，整文件删除（`triedb/pathdb/history.go:301`、`core/rawdb/freezer_table.go:720`）。
-- BAL（Block-level Access List，EIP-7928）：随区块发布、记录本块读写的状态及修改后的新值；区块头只放哈希（`core/types/block.go:134`）。BSC 中类型已存在（`core/types/bal/`），但 Parlia 尚未生成或使用。代价是区块变大，与问题 3 的延迟目标存在冲突。
-
-## 4. 方案要点（新链）
-
-- **两层结构**（因为需要兼容 EVM，两层都要做）：
-  - 第一层（流式历史，必做）：区块、收据、BAL 按高度写成不可变分段，存于对象存储，对外提供拉流接口（参考 Aptos indexer-grpc）。这是唯一的权威数据，替代归档节点。
-  - 第二层（EVM 历史查询）：key-segments、key-index、tx-index、log-index 与历史状态读取器，提供 `eth_call`@N、trace、`eth_getLogs`。只建索引，指向第一层文件中的压缩帧，可从第一层重建。
-- 分段文件内部按约 64KB 压缩帧组织并带偏移表，必须在第一个分段写出前定下。
-- 已知风险：对象存储点查延迟（几十毫秒/次）；索引本身随历史增长（100k TPS 下 tx-index 约 8TB/年）；BAL 增大区块；历史过期带来的生态兼容问题。
-- 决策时点：协议决策（BAL 及传播方式、去 logsBloom、历史过期、状态承诺结构）需在新链规范冻结前定；第一层格式需在第一个分段写出前定；第二层可上线后迭代。
-- **BSC 现网立即可做**：把 hash 归档换成 Erigon、reth-bsc 或 Geth path 归档（`--state.scheme path --gcmode archive --history.state 0`，当前代码已支持），预计 50TB → 5–7TB。需先在测试网验证，因为 BSC 改过 `triedb/database.go`（+66 行）和 `pathdb/layertree.go`（+45 行）。
+如果该节点没设 `--history.logs 0`，它的 `eth_getLogs` 只能查最近约 3 天。
 
 ## 5. 涉及模块与 merge 策略
 
@@ -70,36 +118,38 @@
 | `core/blockchain.go` | +852 / −232 | 不改，通过钩子取数据 | 高 |
 | `core/rawdb`（freezer 等） | 18 个文件，+1262 / −203 | 只读访问，不改格式 | 高 |
 | `internal/ethapi/api.go` | +810 | 不改；第二层独立进程复用 | 高 |
-| `eth/tracers/api.go` | +239 | 不改；第二层实现其 Backend 接口 | 中 |
-| `eth/api_backend.go`、`eth/state_accessor.go` | +96、+34 | 可选：回退链末尾加查历史服务 | 中 |
 | `consensus/parlia` | BSC 独有 | 新链生成与校验 BAL | 中 |
-| `cmd/geth`、`cmd/utils` | +1703、+814 | 新命令放新文件 | 中 |
 | `core/tracing`、`eth/tracers/live` | `hooks.go` +56；`live` 未改 | 第一层导出器做成 live tracer | 低 |
-| `core/state`（`StateUpdate`、`HistoricDB`） | `stateupdate.go` 未改；`database_history.go` +4 | 第二层实现读分段的 Reader | 低 |
-| `triedb/pathdb` | 31 个文件未改，5 个文件 +89 | 不改；作为原型参考 | 低 |
-| `internal/era`（era1/erae） | 仅 `accumulator.go` +2 | 第一层格式向 erae 靠拢 | 低 |
-| `core/filtermaps`、`core/txindexer.go` | +114、+23 | 第二层复用算法 | 低 |
-| `core/types/bal` | 未改 | 新链启用 | 低 |
+| `core/state`（`StateUpdate`、`HistoricDB`） | 基本未改 | 第二层实现读分段的 Reader | 低 |
+| `triedb/pathdb` | 31 个文件未改，5 个文件 +89 | 不改 | 低 |
+| `internal/era`（era1/erae） | 仅 +2 | 第一层格式向 erae 靠拢 | 低 |
 
-落地原则：新代码放新文件、新目录，通过上游已有接口挂接，不碰 `core/blockchain.go`、`core/rawdb` freezer、`internal/ethapi`。
+落地原则：新代码放新文件、新目录，通过上游已有接口挂接，不碰上面三个高风险处。
 
-- 写入侧挂点：`OnStateUpdate` 钩子（`core/blockchain.go:1993`），用 `--vmtrace` 启用 live tracer。
-- 读取侧挂点：`eth/api_backend.go:226` 的回退链（`StateAt` → `HistoricState`，`core/blockchain_reader.go:561`）和 `core/state/database_history.go` 的 `HistoricDB`。
-- 建议目录：`eth/tracers/live/historyexport.go`、新包 `history/`、`cmd/historyd/`、`cmd/geth/historycmd.go`。
-- 挂在上游接口上的代码虽不会产生 merge 冲突，但上游改接口时可能编译失败，需把导出器与读取器测试纳入每次 merge 的验收。
+- 写入侧挂点：`OnStateUpdate`（`core/blockchain.go:1993`）。
+- 读取侧挂点：`eth/api_backend.go:226` 的回退链与 `core/state/database_history.go` 的 `HistoricDB`。
+- 建议目录：`eth/tracers/live/historyexport.go`、`history/`、`cmd/historyd/`、`cmd/geth/historycmd.go`。
+- 导出器和读取器的测试需纳入每次 merge 的验收。
 
-## 6. 待决问题
+## 6. 考虑过但未采用的做法
+
+- BSC 单独做存储拆分：与方案二第一层重复，且 `core/rawdb` 是 merge 高风险区。
+- SolsDB（按区块区间封存 hash trie 节点）：分段间互相引用，不能按区间裁剪，也不减少数据量。它的封存与校验机制可作第一层实现参考，或作为同步与执行 I/O 优化的研究方向。
+- 全局哈希路由：解决不了裁剪；索引本身约数 TB；trie 每层一次网络往返。
+
+## 7. 待决问题
 
 - [x] 新链是否兼容 EVM —— 已确认兼容，第二层必做。
-- [ ] 现有 50TB 的构成，以及是否从创世块开始（见第 2 节确认方法）。
-- [ ] BAL 本体随区块传播还是只承诺哈希、异步传播（需与问题 3 一起定）。
-- [ ] 归档数据主要使用方，以及 `eth_call`、trace、`getLogs` 的查询占比。
-- [ ] 历史 `eth_getProof` 是否有刚性需求及时间窗口。
-- [ ] 新链状态承诺结构；全节点历史保留窗口；历史服务由谁运营；历史查询 SLA。
-- [ ] `StateUpdate` 能否完整取得明文地址与存储键（`StorageKeyType`）；启用 `OnStateUpdate` 后 `CommitWithUpdate` 的额外开销。
+- [ ] 现有 50TB 的构成及起始高度。
+- [ ] path 归档的实测体积、日增量、追块速度、RPC 兼容性，与 Erigon / reth-bsc 对比后定方案一主选。
+- [ ] BAL 随区块传播还是只承诺哈希、异步传播（需与问题 3 一起定）。
+- [ ] 第一层长期保存完整 BAL，还是只存写入部分和交易序号（裁掉只读槽后无法再对区块头哈希校验）。
+- [ ] 第一层分段大小与 checkpoint 间隔；新链 pathdb 状态历史短窗口的长度。
+- [ ] 归档数据使用方与查询构成；历史 `eth_getProof` 需求；状态承诺结构；全节点历史窗口；历史服务运营方；SLA。
+- [ ] `StateUpdate` 能否完整取得明文地址与存储键；启用 `OnStateUpdate` 后的额外开销。
 
-## 7. 建议的下一步
+## 8. 建议的下一步
 
 1. 拿到 50TB 节点的配置、`geth db inspect` 结果和日增量。
-2. 在测试网验证 BSC 的 path 归档（索引与历史查询）。
-3. 做第一层导出器原型：一个 live tracer，在本地开发链上导出每块状态变更，同时回答第 6 节最后一项。
+2. 在测试网实测 BSC path 归档，并与 Erigon、reth-bsc 对比。
+3. 做第一层导出器原型（live tracer），回答第 7 节最后一项。
