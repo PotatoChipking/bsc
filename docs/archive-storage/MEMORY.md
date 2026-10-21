@@ -1,6 +1,6 @@
 # 归档存储方案：讨论记录与结论
 
-最后更新：2026-10-20。用途：保存归档存储（问题 1）讨论的背景、结论和代码依据，方便后续继续推进。
+最后更新：2026-10-21。用途：保存归档存储（问题 1）讨论的背景、结论和代码依据，方便后续继续推进。
 
 完整设计文档（含“附录：参考资料”标签页）：https://claude.ai/code/artifact/918c0de5-9432-47c2-84f1-931dccc6d0d9
 
@@ -129,6 +129,70 @@ path 模式开启 `--history.trienode` 后的机制：
 - hash 离线：`geth snapshot prune-state`，布隆过滤器标记后遍历全库逐个 `batch.Delete`，再 compaction（`core/state/pruner/pruner.go:122-225`）；
 - path 当前状态：按路径原地覆盖或删除（`triedb/pathdb/flush.go:46-55`）；
 - path 状态历史：freezer 尾部截断，整文件删除（`triedb/pathdb/history.go:301`、`core/rawdb/freezer_table.go:720`）。
+
+### 存储结构与读取流程
+
+**“层”的三种含义**（讨论中容易混淆）：
+
+1. trie 的层：树的深度，从根到叶子经过的每个节点是一层。BSC 账户 trie 约 7–8 层，每个合约的存储 trie 再加 6–8 层。每个节点在 KV 库里是单独一条。
+2. pathdb 的层：时间上的版本。磁盘层是 KV 库里的当前 trie 加扁平状态；差异层是内存里最近 128 个块，每块一层。
+3. 方案二的第一、二、三层：历史服务的架构分层（权威数据 / 索引 / 历史证明）。
+
+**path 模式的 KV 键**（`core/rawdb/schema.go:119-125`、`290-298`）：
+
+| 用途 | 键 | 值 |
+| --- | --- | --- |
+| 扁平状态，读状态用 | `"a"` + 账户地址哈希；`"o"` + 账户地址哈希 + 槽位哈希 | 账户数据；存储槽值 |
+| trie 节点，算状态根和证明用 | `"A"` + 节点路径；`"O"` + 账户地址哈希 + 节点路径 | 节点当前内容 |
+
+- 键是节点在树里的**位置**，不是哈希。节点改了，位置不变、键不变，`Put` 直接覆盖，所以只有最新一份。hash 模式以节点哈希作键（`WriteLegacyTrieNode`），每个新版本都是新键，旧键一直留着，这就是 hash 库持续增长的根本原因。
+- 哈希只用于校验：读出节点后现算 Keccak，和父节点里记录的孩子哈希比对（`ReadAccountTrieNodeAndHash`，`accessors_trie.go:49`）。
+
+**trie 节点的持久化**：
+
+1. 区块执行完，`StateDB.Commit` 收集本块改动的节点，交给 `pathdb.Database.Update`（`database.go:308`），成为内存里的一个新差异层。内存保留 128 层。
+2. 最老的差异层合并时（`diskLayer.commit`，`disklayer.go:423`）：先写状态历史和 trienode 历史（旧值）进 freezer，再记录“状态根 → 状态序号”，然后并进写缓冲。
+3. 写缓冲满（大小由 `--cache.gc` 决定）后在后台刷盘（`buffer.flush`，`buffer.go:135`）：先同步历史 freezer，再把节点、扁平状态、状态序号、快照根放在一个批次里写入。
+4. 正常关机时，内存层和写缓冲写进日志文件（`Database.Journal`，`journal.go:321`），重启后恢复。
+
+**同一个节点的版本分布**：最新版本在 KV 库；每次被覆盖前的旧版本在 trienode freezer（多数只存差异）。每个版本长期只在一处。只在“旧值已写入 freezer、写缓冲还没刷盘”这段时间里，两边会短暂重叠。
+
+**freezer 结构**（`core/rawdb/freezer*.go`、`ancient_scheme.go`）：
+
+- 三个 freezer：`chain`（headers、hashes、bodies、receipts、diffs、blobs）、`state`（状态历史，5 张表）、`trienode`（trienode.header、trienode.key、trienode.value）。
+- 每张表 = 索引文件（`.cidx` 压缩 / `.ridx` 不压缩，每条 6 字节：2 字节数据文件编号 + 4 字节结束偏移）+ 数据文件（`表名.0000.cdat` 等，单个最大约 2GB）+ `.meta`（版本、虚拟尾部、刷盘位置）。
+- 同一 freezer 里所有表的条目数一致，第 i 条对应同一个块或状态序号。只追加；截头用于回滚，截尾先移动虚拟尾部、再整文件删除。
+- 单表上限：文件编号 2 字节，最多 65536 个文件 × 2GB，约 131TB。新链规模下几年内可能触顶。
+- trienode 历史每块一条记录：头部（父根、当前根、区块号、涉及的 trie 及偏移）、键段（被改节点的路径，前缀压缩、带重启点，可二分查找）、值段（旧值或差异）。键段和值段不压缩，以便只读一小段（`AncientBytes`）。
+
+**freezer 的读取流程**（以 `ReadBodyRLP(db, hash, N)` 为例，`accessors_chain.go:392`）：
+
+1. 在 `ReadAncients` 读锁内，先读 `hashes` 表第 N 条，比对是否等于传入的哈希（`isCanon`），确认是规范链；不是，就回 KV 库按“块号 + 哈希”读。
+2. `bodies` 表 `Retrieve(N)`：检查 N 没越界、没被隐藏；令 `i = N − itemOffset`，从索引文件偏移 `i × 6` 读 12 字节，得到第 i、i+1 条索引；算出数据所在文件和区间；一次 `ReadAt` 读出；snappy 解压（`freezer_table.go:997-1180`）。
+3. 单条读取 = 2 次磁盘读（索引 + 数据）。批量读会把同一文件里的相邻条目合并成一次读取。
+
+**N 从哪来**：chain freezer 里 N 就是区块号；state 和 trienode freezer 里 N 是状态序号，与区块号一一对应但不一定相等。N 由调用方传入，读的一方要先靠 KV 库里的小索引把手里的键换成 N：
+
+| 手里有什么 | 怎么拿到 N |
+| --- | --- |
+| 区块哈希 | `"H"` + 哈希 → 区块号（`ReadHeaderNumber`，`accessors_chain.go:88`） |
+| 交易哈希 | `"l"` + 交易哈希 → 区块号 |
+| 日志条件 | filtermaps → 区块号 |
+| 状态根 | `ReadStateID` → 状态序号 |
+| 节点路径（历史节点） | trienode 历史索引 → 修改过它的状态序号 |
+
+建不出这类小索引的读取入口，就不适合按 N 存储，hash trie 节点正是这种情况（父节点只有子节点哈希），这也是 SolsDB 读取路径的卡点。方案二的第二层，本质就是把这些“找 N”的索引补齐、做紧凑、放到共享存储上。
+
+**证明路径怎么找节点**（`Trie.Prove`，`trie/proof.go:37`）：从根开始，路径边走边算。遇到分支节点，取 `Children[key[0]]`，路径加上 `key[0]`；遇到扩展或叶子节点，跳过它那段键，路径加上这段键；遇到哈希引用，调用 `reader.Node(path, hash)` 读入。读取接口同时传路径和期望哈希（`triedb/database/database.go:34`）：hash 模式按哈希读，path 模式按路径读并校验哈希。证明本身仍按哈希组织，验证方从状态根逐层核对。
+
+**读取次数汇总**：
+
+| | 当前状态 | 区块 N 的历史状态（path 归档） | hash 归档 |
+| --- | --- | --- | --- |
+| 读状态值（余额、存储槽、`eth_call` 内读取） | 扁平状态 1 次 KV | 查索引 + 状态历史 freezer，约 1 次 KV + 1–2 次 freezer | 用旧状态根逐层走 trie，约 10–15 次 KV，在大 LSM 库里 |
+| 证明 | 路径上每个节点按路径读 1 次，账户 trie 约 7–8 次（存储槽再加 6–8 次），顶层常驻缓存 | 每个节点：读当前值，对不上再查索引、读若干条 trienode 记录（并发预取，直到完整值或用当前值兜底），再倒序拼回 | 每层按哈希 1 次 KV，约 10–15 次，在大 LSM 库里 |
+
+内存里最近 128 个差异层和 trie 的干净缓存会让实际读盘更少。hash 与 path 在历史证明上谁更快需实测（已列入方案一的实测项）。
 
 ## 4. 关于 50TB 的判断
 
